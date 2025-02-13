@@ -18,7 +18,6 @@ export default function Home() {
   const [showMapping, setShowMapping] = useState(false);
   const [mappings, setMappings] = useState({});
   const [generatedTemplate, setGeneratedTemplate] = useState(null);
-  const [nameOption, setNameOption] = useState('source');
   const [uploadedFiles, setUploadedFiles] = useState([]);
 
   const handleFileSelect = useCallback((files) => {
@@ -74,61 +73,151 @@ export default function Home() {
   }, []);
 
   const handleProcess = useCallback(async () => {
-    if (!selectedFile) {
-      toast.error('Please select a file to process');
-      return;
-    }
+    if (!selectedFile || !templateFile) return;
 
-    if (!templateFile) {
-      toast.error('Please upload a template file first');
+    try {
+      // Read the source file data
+      const sourceWorkbook = XLSX.read(selectedFile.data, { type: 'array' });
+      
+      // Process all sheets
+      const processedSheets = sourceWorkbook.SheetNames.map(sheetName => {
+        const sourceSheet = sourceWorkbook.Sheets[sheetName];
+        const sourceData = XLSX.utils.sheet_to_json(sourceSheet, { header: 1 });
+        
+        if (sourceData.length === 0) {
+          return null;
+        }
+
+        // Get headers from first row
+        const headers = sourceData[0].map(header => header?.toString() || '').filter(Boolean);
+        
+        return {
+          name: sheetName,
+          headers: headers,
+          data: sourceData.slice(1)
+        };
+      }).filter(sheet => sheet !== null && sheet.headers.length > 0);
+      
+      if (processedSheets.length === 0) {
+        toast.error('No valid data found in source file');
+        return;
+      }
+
+      setWorkbookData({
+        sheets: processedSheets
+      });
+      
+      setShowMapping(true);
+      toast.success('Files processed successfully.');
+    } catch (error) {
+      console.error('Processing error:', error);
+      toast.error('Error processing files. Please try again.');
+    }
+  }, [selectedFile, templateFile]);
+
+  const handleGenerateTemplate = useCallback(async () => {
+    if (!selectedFile || !templateFile || !workbookData) {
+      toast.error('Please upload both source and template files');
       return;
     }
 
     try {
-      // Convert base64/stored data to format XLSX can read
-      const data = selectedFile.data;
-      const workbook = XLSX.read(data, { type: 'array' });
-      
-      const sheets = workbook.SheetNames.map(name => {
-        const sheet = workbook.Sheets[name];
-        // Read the first row to get headers
-        const headerRow = XLSX.utils.sheet_to_json(sheet, { header: 1 })[0] || [];
-        
-        // Convert headers to strings and filter out empty ones
-        const validHeaders = headerRow
-          .map(header => header?.toString() || '')
-          .filter(header => header.trim() !== '');
+      // Read template file
+      const templateWorkbook = XLSX.read(templateFile.data, { type: 'array' });
+      const sourceWorkbook = XLSX.read(selectedFile.data, { type: 'array' });
 
-        // Get all data including empty cells
-        const jsonData = XLSX.utils.sheet_to_json(sheet, { 
-          defval: '', // Set default value for empty cells
-          raw: false, // Convert all values to string
-          header: validHeaders // Use the processed headers
+      // Create a map of source data by sheet name for quick lookup
+      const sourceDataBySheet = {};
+      workbookData.sheets.forEach(sheet => {
+        sourceDataBySheet[sheet.name] = {
+          headers: sheet.headers,
+          data: sheet.data
+        };
+      });
+
+      // Create new workbook for mapped data
+      const newWorkbook = XLSX.utils.book_new();
+
+      // Process each template sheet
+      templateData.forEach(templateSheet => {
+        // Create a new sheet
+        const newSheet = XLSX.utils.aoa_to_sheet([[]]);
+
+        // Get template headers for this sheet
+        const templateHeaders = templateSheet.headers.map(header => 
+          `${templateSheet.name}|${header.field}`
+        );
+        const headerRow = templateHeaders.map(header => header.split('|')[1]);
+        XLSX.utils.sheet_add_aoa(newSheet, [headerRow], { origin: 0 });
+
+        // Create a set of unique source sheets used in mappings for this template sheet
+        const usedSourceSheets = new Set();
+        templateHeaders.forEach(templateField => {
+          const sourceField = mappings[templateField];
+          if (sourceField) {
+            const [sourceSheet] = sourceField.split('|');
+            usedSourceSheets.add(sourceSheet);
+          }
         });
 
-        return {
-          name,
-          headers: validHeaders,
-          data: jsonData
-        };
-      }).filter(sheet => sheet.headers.length > 0);
+        // Get the first source sheet that has mappings, or use first available if none
+        const primarySourceSheet = usedSourceSheets.size > 0 
+          ? Array.from(usedSourceSheets)[0]
+          : workbookData.sheets[0].name;
 
-      if (sheets.length === 0) {
-        toast.error('No valid data found in the file');
-        return;
-      }
+        // Use the data from primary source sheet for row count
+        const sourceSheetData = sourceDataBySheet[primarySourceSheet];
+        if (!sourceSheetData) {
+          console.error(`Source sheet ${primarySourceSheet} not found`);
+          return;
+        }
 
-      setWorkbookData({ sheets });
-      setShowMapping(true);
-      setMappings({}); // Reset mappings when processing new file
-      toast.success('File processed successfully');
+        // Map data according to mappings, using empty string for unmapped fields
+        const mappedData = sourceSheetData.data.map(row => {
+          return templateHeaders.map(templateField => {
+            const sourceField = mappings[templateField];
+            if (!sourceField) return ''; // Return empty string for unmapped fields
+
+            const [sourceSheet, sourceHeader] = sourceField.split('|');
+            const sourceSheetData = sourceDataBySheet[sourceSheet];
+            if (!sourceSheetData) return '';
+
+            const sourceIndex = sourceSheetData.headers.indexOf(sourceHeader);
+            if (sourceIndex === -1) return '';
+
+            // If mapping is from a different sheet, find matching row by index
+            const rowIndex = sourceSheet === primarySourceSheet 
+              ? sourceSheetData.data.indexOf(row)
+              : sourceSheetData.data.length > sourceSheetData.data.indexOf(row)
+                ? sourceSheetData.data.indexOf(row)
+                : -1;
+
+            return rowIndex >= 0 && rowIndex < sourceSheetData.data.length 
+              ? sourceSheetData.data[rowIndex][sourceIndex] 
+              : '';
+          });
+        });
+
+        // Add mapped data to sheet
+        XLSX.utils.sheet_add_aoa(newSheet, mappedData, { origin: 'A2' });
+        
+        // Add the sheet to workbook with original template sheet name
+        XLSX.utils.book_append_sheet(newWorkbook, newSheet, templateSheet.name);
+      });
+
+      // Generate Excel file
+      const excelBuffer = XLSX.write(newWorkbook, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([excelBuffer], { 
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      });
+
+      setGeneratedTemplate(blob);
+      toast.success('Template generated successfully!');
     } catch (error) {
-      console.error('Error processing file:', error);
-      toast.error('Error processing file');
-      setWorkbookData(null);
-      setShowMapping(false);
+      console.error('Generation error:', error);
+      toast.error('Error generating template. Please try again.');
     }
-  }, [selectedFile, templateFile]);
+  }, [selectedFile, templateFile, workbookData, mappings, templateData]);
 
   const handleFilesUpload = useCallback((newFiles) => {
     setUploadedFiles(newFiles);
@@ -153,152 +242,38 @@ export default function Home() {
     setMappings(newMappings);
   }, []);
 
-  const handleGenerateTemplate = () => {
-    if (!templateFile) {
-      toast.error('Please upload a template file first');
-      return;
-    }
-
-    console.log('Current mappings:', mappings);
-    console.log('Template data:', templateData);
-    console.log('Workbook data:', workbookData);
-
-    try {
-      // Create a new workbook
-      const wb = XLSX.utils.book_new();
-      
-      // Create a map of source sheet data for quick access
-      const sourceSheetData = {};
-      if (workbookData?.sheets) {
-        workbookData.sheets.forEach(sheet => {
-          sourceSheetData[sheet.name] = sheet.data;
-        });
-      }
-
-      console.log('Source sheet data:', sourceSheetData);
-
-      // Process each template sheet
-      templateData.forEach(templateSheet => {
-        const templateSheetName = templateSheet.name;
-        
-        // Get all template fields for this sheet
-        const templateFields = templateSheet.headers.map(header => header.field);
-        
-        // Create header row with all template fields
-        const headerRow = {};
-        templateFields.forEach(field => {
-          headerRow[field] = field;
-        });
-
-        // Initialize mappedData with header row
-        const mappedData = [headerRow];
-
-        // If we have source data and mappings, add the mapped data
-        if (Object.keys(sourceSheetData).length > 0) {
-          // Create mapping lookup for this template sheet
-          const sheetMappings = {};
-          Object.entries(mappings).forEach(([templateField, sourceValue]) => {
-            const [tSheet, tField] = templateField.split('|');
-            if (tSheet === templateSheetName && sourceValue) {
-              const [sSheet, sField] = sourceValue.split('|');
-              sheetMappings[tField] = { sourceSheet: sSheet, sourceField: sField };
-            }
-          });
-
-          // Process source data if we have mappings
-          if (Object.keys(sheetMappings).length > 0) {
-            // Get unique source sheets used in mappings
-            const sourceSheets = new Set(Object.values(sheetMappings).map(m => m.sourceSheet));
-            
-            // Process each source sheet's data
-            sourceSheets.forEach(sourceSheetName => {
-              const sourceData = sourceSheetData[sourceSheetName];
-              if (sourceData && sourceData.length > 1) { // Skip header row
-                const dataRows = sourceData.slice(1).map(row => {
-                  const newRow = {};
-                  // Process all template fields
-                  templateFields.forEach(templateField => {
-                    const mapping = sheetMappings[templateField];
-                    if (mapping && mapping.sourceSheet === sourceSheetName) {
-                      // If field is mapped and from current source sheet, get the value
-                      newRow[templateField] = row[mapping.sourceField];
-                    } else {
-                      // If field is not mapped or from different sheet, leave empty
-                      newRow[templateField] = '';
-                    }
-                  });
-                  return newRow;
-                });
-                mappedData.push(...dataRows);
-              }
-            });
-          } else {
-            // Add an empty row with all template fields
-            mappedData.push(templateFields.reduce((row, field) => {
-              row[field] = '';
-              return row;
-            }, {}));
-          }
-        } else {
-          // Add an empty row with all template fields
-          mappedData.push(templateFields.reduce((row, field) => {
-            row[field] = '';
-            return row;
-          }, {}));
-        }
-
-        // Create worksheet
-        const ws = XLSX.utils.json_to_sheet(mappedData, { skipHeader: true });
-        XLSX.utils.book_append_sheet(wb, ws, templateSheetName);
-        console.log(`Created sheet ${templateSheetName} with data:`, mappedData);
-      });
-
-      // Generate buffer
-      const wbout = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
-      
-      // Create blob and URL
-      const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      const url = URL.createObjectURL(blob);
-      
-      setGeneratedTemplate({
-        url,
-        filename: `mapped_template_${new Date().getTime()}.xlsx`
-      });
-
-      toast.success('Template generated successfully!');
-    } catch (error) {
-      console.error('Error generating template:', error);
-      toast.error(`Failed to generate template: ${error.message}`);
-    }
-  };
-
-  const handleDownloadTemplate = () => {
+  const handleDownloadTemplate = useCallback(() => {
     if (!generatedTemplate) return;
 
-    // Use source file name + "_mapped" as the default naming convention
-    const fileName = `${selectedFile.name.split('.').slice(0, -1).join('.')}_mapped.xlsx`;
-    
-    // Convert the template to a blob
-    const blob = new Blob([generatedTemplate], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    
-    // Create download link and trigger download
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    window.URL.revokeObjectURL(url);
-    document.body.removeChild(a);
+    try {
+      const url = window.URL.createObjectURL(generatedTemplate);
+      const link = document.createElement('a');
+      link.href = url;
+      
+      // Generate filename
+      const baseFileName = selectedFile 
+        ? selectedFile.name.split('.').slice(0, -1).join('.')
+        : 'template';
+      const fileName = `${baseFileName}_mapped.xlsx`;
+      
+      link.setAttribute('download', fileName);
+      document.body.appendChild(link);
+      link.click();
+      
+      // Cleanup
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      }, 0);
 
-    // Reset states after download
-    setGeneratedTemplate(null);
-    setSelectedFile(null);
-    setWorkbookData(null);
-    setShowMapping(false);
-    setMappings({});
-    toast.success('Template downloaded successfully! Ready for new mapping.');
-  };
+      // Reset only the generated template to show generate button again
+      setGeneratedTemplate(null);
+      toast.success('Template downloaded successfully!');
+    } catch (error) {
+      console.error('Download error:', error);
+      toast.error('Error downloading template. Please try again.');
+    }
+  }, [generatedTemplate, selectedFile]);
 
   const handleReset = useCallback(() => {
     setSelectedFile(null);
@@ -346,14 +321,14 @@ export default function Home() {
                   {uploadedFiles.map((file, index) => (
                     <div 
                       key={index} 
-                      className={`flex items-center gap-4 p-4 hover:bg-gray-100 cursor-pointer transition-colors ${
+                      className={`flex items-center gap-4 p-4 hover:bg-gray-100 cursor-pointer transition-colors group ${
                         selectedFile === file ? 'bg-blue-100' : ''
                       }`}
                       onClick={() => handleSelectFile(file)}
                     >
                       <span className="flex-1 truncate text-gray-800">{file.name}</span>
                       <button 
-                        className="p-2 transition-colors"
+                        className="p-2 transition-opacity opacity-0 group-hover:opacity-100"
                         onClick={(e) => {
                           e.stopPropagation();
                           handleRemoveFile(index);
@@ -377,14 +352,21 @@ export default function Home() {
                 <div className="flex justify-center mt-6">
                   <button 
                     className={`px-6 py-3 rounded-lg transition-colors ${
-                      selectedFile && templateFile
-                        ? 'bg-[#64afec] hover:bg-[#5193c7] text-white' 
-                        : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      !templateFile
+                        ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                        : selectedFile && templateFile
+                          ? 'bg-[#64afec] hover:bg-[#5193c7] text-white' 
+                          : 'bg-gray-300 text-gray-500 cursor-not-allowed'
                     }`}
                     onClick={handleProcess}
                     disabled={!selectedFile || !templateFile}
                   >
-                    Process File
+                    {!templateFile 
+                      ? 'Missing Template File' 
+                      : !selectedFile 
+                        ? 'Select Source File'
+                        : 'Process File'
+                    }
                   </button>
                 </div>
               )}
@@ -394,7 +376,7 @@ export default function Home() {
             <div className="mt-6">
               <h3 className="text-lg font-medium mb-4 text-gray-700">Template Files</h3>
               {templateFile ? (
-                <div className="w-full border rounded-lg p-4 bg-gray-50">
+                <div className="w-full border rounded-lg p-4 bg-gray-50 group hover:bg-gray-100 transition-colors">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center space-x-3">
                       <Image
@@ -414,7 +396,8 @@ export default function Home() {
                         setMappings({});
                         toast.success('Template file removed');
                       }}
-                      className="p-2 transition-colors"
+                      className="p-2 transition-opacity opacity-0 group-hover:opacity-100"
+                      title="Remove template"
                     >
                       <Image 
                         src="/close.png"
@@ -428,18 +411,51 @@ export default function Home() {
               ) : (
                 <div
                   {...getTemplateRootProps()}
-                  className={`w-full border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-all duration-300
+                  className={`w-full border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-all duration-300 group
                     ${isTemplateDragActive ? 'border-[#64afec] bg-blue-100' : 'border-gray-300 hover:border-blue-500 hover:bg-gray-50'}`}
                 >
                   <input {...getTemplateInputProps()} />
                   <div className="space-y-2">
                     <div className="mx-auto text-center text-gray-400 text-2xl mb-2">📄</div>
                     <p className="text-sm text-gray-500">
-                      {isTemplateDragActive ? 
-                        "Drop the template file here..." : 
-                        "Drag and drop template file, or click to select"}
+                      {isTemplateDragActive ? "Drop the template here..." : "Drag and drop template file, or click to select"}
                     </p>
                   </div>
+                  {templateFile && (
+                    <div className="mt-4 border-t pt-4">
+                      <div className="flex items-center justify-between group">
+                        <div className="flex items-center space-x-3">
+                          <Image
+                            src="/check.png"
+                            alt="Checked file"
+                            width={18}
+                            height={18}
+                          />
+                          <span className="text-gray-800">{templateFile.name}</span>
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setTemplateFile(null);
+                            setTemplateData(null);
+                            setGeneratedTemplate(null);
+                            setShowMapping(false);
+                            setMappings({});
+                            toast.success('Template file removed');
+                          }}
+                          className="p-2 transition-opacity opacity-0 group-hover:opacity-100"
+                          title="Remove template"
+                        >
+                          <Image 
+                            src="/close.png"
+                            alt="Remove template file"
+                            width={20}
+                            height={20}
+                          />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -462,13 +478,14 @@ export default function Home() {
                     </div>
                   )
                 ) : (
-                  <div className="p-4 bg-green-50 rounded-lg">
+                  <div className="p-4 bg-green-50 rounded-lg mt-6">
                     <div className="flex flex-col space-y-4">
                       <div className="flex items-center justify-between">
-                        <span className="text-sm text-green-700">Template ready!</span>
+                        <span className="text-sm text-green-700">Click the ICON to download.</span>
                         <button
                           onClick={handleDownloadTemplate}
-                          className="px-4 py-2 transition-colors text-sm"
+                          className="px-4 py-2 transition-colors text-sm hover:bg-green-100 rounded-lg"
+                          title="Download template"
                         >
                           <Image 
                             src="/download.png"
@@ -477,35 +494,6 @@ export default function Home() {
                             height={20}
                           />
                         </button>
-                      </div>
-                      
-                      {/* File Name Options */}
-                      <div className="mt-2 border-t pt-3">
-                        <p className="text-sm font-medium text-gray-700 mb-2">File Name Options:</p>
-                        <div className="space-y-2">
-                          <label className="flex items-center space-x-2">
-                            <input
-                              type="radio"
-                              name="nameOption"
-                              value="original"
-                              checked={nameOption === 'original'}
-                              onChange={(e) => setNameOption(e.target.value)}
-                              className="text-custom-blue focus:ring-custom-blue"
-                            />
-                            <span className="text-sm text-gray-600">Use original name</span>
-                          </label>
-                          <label className="flex items-center space-x-2">
-                            <input
-                              type="radio"
-                              name="nameOption"
-                              value="source"
-                              checked={nameOption === 'source'}
-                              onChange={(e) => setNameOption(e.target.value)}
-                              className="text-custom-blue focus:ring-custom-blue"
-                            />
-                            <span className="text-sm text-gray-600">Use source file name + "_mapped"</span>
-                          </label>
-                        </div>
                       </div>
                     </div>
                   </div>
@@ -521,7 +509,7 @@ export default function Home() {
               {showMapping && (
                 <button
                   onClick={handleReset}
-                  className="px-4 py-2 transition-colors text-sm flex items-center gap-2"
+                  className="px-4 py-2 transition-colors text-sm flex items-center gap-2 hover:bg-blue-300 hover:text-white rounded-md"
                 >
                   <Image 
                     src="/reset.png"
@@ -548,7 +536,7 @@ export default function Home() {
                 </div>
               </div>
             ) : (
-              <div className="flex items-center justify-center h-[200px] text-sm text-gray-500">
+              <div className="flex items-center justify-center h-[200px] text-lg text-gray-500">
                 {selectedFile 
                   ? "Click Process to start mapping" 
                   : "Select a file to process"}
